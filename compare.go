@@ -14,12 +14,20 @@ type AttestationResult struct {
 	Timestamp  string            `json:"timestamp"`
 }
 
+// criticalCollectors are collectors whose errors are treated as hard failures
+// rather than soft drift, because they guard integrity-sensitive state.
+var criticalCollectors = map[string]bool{
+	"model":  true,
+	"policy": true,
+}
+
 // compare evaluates all collector results and produces a scored attestation.
 //
 // Scoring:
 //   - Each collector that ran (not skipped) contributes equally.
 //   - "pass" = 1.0, "drift" = 0.5, "error" = 0.0, "fail" findings downgrade.
 //   - Overall verdict: all pass → "pass", any drift → "drift", any fail → "fail".
+//   - Critical collectors (model, policy): errors escalate to "fail" instead of "drift".
 func compare(results []CollectorResult) AttestationResult {
 	att := AttestationResult{
 		Collectors: results,
@@ -46,8 +54,10 @@ func compare(results []CollectorResult) AttestationResult {
 				worstStatus = "drift"
 			}
 		case "error":
-			// error counts as 0
-			if worstStatus != "fail" {
+			// Critical collectors: error → hard fail
+			if criticalCollectors[r.Name] {
+				worstStatus = "fail"
+			} else if worstStatus != "fail" {
 				worstStatus = "drift"
 			}
 		}

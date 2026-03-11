@@ -36,6 +36,7 @@ type AttestConfig struct {
 	Report     ReportConfig     `yaml:"report"`
 	Daemon     DaemonConfig     `yaml:"daemon"`
 	RateLimit  RateLimitConfig  `yaml:"rate_limit"`
+	Privacy    PrivacyProfile   `yaml:"privacy"`
 }
 
 type CollectorToggle struct {
@@ -48,9 +49,11 @@ type CollectorToggle struct {
 }
 
 type ModelConfig struct {
-	VaultDir       string   `yaml:"vault_dir"`
-	RegistryURL    string   `yaml:"registry_url"`
-	AllowedFormats []string `yaml:"allowed_formats"`
+	VaultDir         string   `yaml:"vault_dir"`
+	RegistryURL      string   `yaml:"registry_url"`
+	RegistryTokenEnv string   `yaml:"registry_token_env"`
+	AllowedFormats   []string `yaml:"allowed_formats"`
+	MaxFileSize      int64    `yaml:"max_file_size"`
 }
 
 type ContainerConfig struct {
@@ -90,12 +93,22 @@ type ReportConfig struct {
 }
 
 type DaemonConfig struct {
-	IntervalSeconds int    `yaml:"interval_seconds"`
-	BindAddr        string `yaml:"bind_addr"`
+	IntervalSeconds  int    `yaml:"interval_seconds"`
+	BindAddr         string `yaml:"bind_addr"`
+	ReadTimeoutSec   int    `yaml:"read_timeout_seconds"`
+	WriteTimeoutSec  int    `yaml:"write_timeout_seconds"`
 }
 
 type RateLimitConfig struct {
 	RequestsPerMinute int `yaml:"requests_per_minute"`
+}
+
+// PrivacyProfile controls what gets stripped from audit logs and reports.
+type PrivacyProfile struct {
+	StripHostname    bool `yaml:"strip_hostname"`
+	StripPaths       bool `yaml:"strip_paths"`
+	StripListeners   bool `yaml:"strip_listeners"`
+	StripPolicyNames bool `yaml:"strip_policy_names"`
 }
 
 // ---------------------------------------------------------------------------
@@ -302,7 +315,12 @@ func runAttestation() TrustReport {
 	att := compare(results)
 	report := generateReport(att)
 
-	// Sign if key is available.
+	// Apply privacy redaction if configured.
+	if cfg.Privacy != (PrivacyProfile{}) {
+		report = redactReport(report, cfg.Privacy)
+	}
+
+	// Sign if key is available (sign after redaction so signature covers redacted form).
 	if cfg.Report.SigningKey != "" {
 		signed, err := signReport(report, cfg.Report.SigningKey)
 		if err != nil {
@@ -418,12 +436,7 @@ func runDaemon(bindAddr string, interval time.Duration) {
 	loadServiceToken()
 	initAuditLog()
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/health", handleHealth)
-	mux.HandleFunc("/v1/attest", handleAttest)
-	mux.HandleFunc("/v1/report/latest", handleLatestReport)
-	mux.HandleFunc("/v1/reload", requireServiceToken(handleReload))
-	mux.HandleFunc("/v1/metrics", handleMetrics)
+	mux := buildMux()
 
 	// Run initial attestation.
 	runAttestation()
@@ -440,10 +453,38 @@ func runDaemon(bindAddr string, interval time.Duration) {
 		log.Printf("periodic attestation every %s", interval)
 	}
 
+	pol := getPolicy()
+	readTimeout := pol.Attestation.Daemon.ReadTimeoutSec
+	if readTimeout <= 0 {
+		readTimeout = 30
+	}
+	writeTimeout := pol.Attestation.Daemon.WriteTimeoutSec
+	if writeTimeout <= 0 {
+		writeTimeout = 60
+	}
+
+	srv := &http.Server{
+		Addr:         bindAddr,
+		Handler:      mux,
+		ReadTimeout:  time.Duration(readTimeout) * time.Second,
+		WriteTimeout: time.Duration(writeTimeout) * time.Second,
+	}
+
 	log.Printf("runtime-attestor daemon listening on %s", bindAddr)
-	if err := http.ListenAndServe(bindAddr, mux); err != nil {
+	if err := srv.ListenAndServe(); err != nil {
 		log.Fatalf("server error: %v", err)
 	}
+}
+
+// buildMux constructs the HTTP handler. Auth required on all non-health endpoints.
+func buildMux() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", handleHealth)
+	mux.HandleFunc("/v1/attest", requireServiceToken(handleAttest))
+	mux.HandleFunc("/v1/report/latest", requireServiceToken(handleLatestReport))
+	mux.HandleFunc("/v1/reload", requireServiceToken(handleReload))
+	mux.HandleFunc("/v1/metrics", requireServiceToken(handleMetrics))
+	return mux
 }
 
 // ---------------------------------------------------------------------------

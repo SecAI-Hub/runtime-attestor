@@ -64,7 +64,7 @@ func collectModelState(cfg ModelConfig) CollectorResult {
 	}
 
 	// Enumerate model files in the vault.
-	localModels, err := hashModelFiles(cfg.VaultDir, cfg.AllowedFormats)
+	localModels, err := hashModelFiles(cfg.VaultDir, cfg.AllowedFormats, cfg.MaxFileSize)
 	if err != nil {
 		result.Status = "error"
 		result.Error = fmt.Sprintf("scan vault: %v", err)
@@ -82,7 +82,7 @@ func collectModelState(cfg ModelConfig) CollectorResult {
 	}
 
 	// Fetch approved manifest from registry if available.
-	approved, err := fetchRegistryManifest(cfg.RegistryURL)
+	approved, err := fetchRegistryManifest(cfg.RegistryURL, cfg.RegistryTokenEnv)
 	if err != nil {
 		// Registry unavailable — report local hashes without comparison.
 		for filename, hash := range localModels {
@@ -143,12 +143,20 @@ func collectModelState(cfg ModelConfig) CollectorResult {
 	return result
 }
 
+// defaultMaxModelSize is 10 GiB.
+const defaultMaxModelSize = 10 << 30
+
 // hashModelFiles walks a directory and returns filename -> sha256 for model files.
-func hashModelFiles(dir string, formats []string) (map[string]string, error) {
+// Rejects symlinks, device files, FIFOs, and files exceeding maxSize.
+func hashModelFiles(dir string, formats []string, maxSize int64) (map[string]string, error) {
 	results := make(map[string]string)
 	formatSet := make(map[string]bool)
 	for _, f := range formats {
 		formatSet["."+f] = true
+	}
+
+	if maxSize <= 0 {
+		maxSize = defaultMaxModelSize
 	}
 
 	entries, err := os.ReadDir(dir)
@@ -160,11 +168,34 @@ func hashModelFiles(dir string, formats []string) (map[string]string, error) {
 		if entry.IsDir() {
 			continue
 		}
+
+		// Reject symlinks
+		if entry.Type()&os.ModeSymlink != 0 {
+			continue
+		}
+
 		ext := strings.ToLower(filepath.Ext(entry.Name()))
 		if len(formatSet) > 0 && !formatSet[ext] {
 			continue
 		}
-		hash, err := sha256File(filepath.Join(dir, entry.Name()))
+
+		path := filepath.Join(dir, entry.Name())
+
+		// Use Lstat to detect symlinks that ReadDir may not flag
+		info, err := os.Lstat(path)
+		if err != nil {
+			continue
+		}
+		// Reject non-regular files (symlinks, devices, FIFOs, sockets)
+		if !info.Mode().IsRegular() {
+			continue
+		}
+		// Enforce max file size
+		if info.Size() > maxSize {
+			continue
+		}
+
+		hash, err := sha256File(path)
 		if err != nil {
 			return nil, fmt.Errorf("hash %s: %w", entry.Name(), err)
 		}
@@ -187,14 +218,35 @@ func sha256File(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
+// maxRegistryResponse is the maximum response body size from the registry (1 MiB).
+const maxRegistryResponse = 1 << 20
+
 // fetchRegistryManifest calls the SecAI_OS registry to get approved models.
-func fetchRegistryManifest(registryURL string) ([]RegistryModel, error) {
+// tokenEnv names the environment variable holding a bearer token for registry auth.
+func fetchRegistryManifest(registryURL, tokenEnv string) ([]RegistryModel, error) {
 	if registryURL == "" {
 		return nil, fmt.Errorf("registry_url not configured")
 	}
 
+	// Basic URL validation: must start with http:// or https://
+	if !strings.HasPrefix(registryURL, "http://") && !strings.HasPrefix(registryURL, "https://") {
+		return nil, fmt.Errorf("registry_url must use http or https scheme: %q", registryURL)
+	}
+
 	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(registryURL + "/v1/models")
+	req, err := http.NewRequest(http.MethodGet, registryURL+"/v1/models", nil)
+	if err != nil {
+		return nil, fmt.Errorf("build registry request: %w", err)
+	}
+
+	// Add auth header if configured
+	if tokenEnv != "" {
+		if tok := os.Getenv(tokenEnv); tok != "" {
+			req.Header.Set("Authorization", "Bearer "+tok)
+		}
+	}
+
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("registry request: %w", err)
 	}
@@ -207,7 +259,8 @@ func fetchRegistryManifest(registryURL string) ([]RegistryModel, error) {
 	var envelope struct {
 		Models []RegistryModel `json:"models"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
+	// Limit response body to prevent unbounded reads
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxRegistryResponse)).Decode(&envelope); err != nil {
 		return nil, fmt.Errorf("decode registry response: %w", err)
 	}
 	return envelope.Models, nil
@@ -743,6 +796,27 @@ func collectPolicyState(cfg PolicyFilesConfig) CollectorResult {
 
 	hasDrift := false
 	for name, path := range cfg.Files {
+		// Reject symlinks and non-regular files for policy files
+		info, err := os.Lstat(path)
+		if err != nil {
+			result.Findings = append(result.Findings, Finding{
+				Key:    name,
+				Status: "error",
+				Detail: fmt.Sprintf("cannot stat: %v", err),
+			})
+			hasDrift = true
+			continue
+		}
+		if !info.Mode().IsRegular() {
+			result.Findings = append(result.Findings, Finding{
+				Key:    name,
+				Status: "fail",
+				Detail: fmt.Sprintf("policy file is not a regular file (mode=%s)", info.Mode()),
+			})
+			hasDrift = true
+			continue
+		}
+
 		hash, err := sha256File(path)
 		if err != nil {
 			result.Findings = append(result.Findings, Finding{

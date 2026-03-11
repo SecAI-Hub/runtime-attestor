@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -75,6 +76,18 @@ func TestHealthEndpoint(t *testing.T) {
 	}
 }
 
+func TestHealthEndpoint_NoAuthRequired(t *testing.T) {
+	serviceToken = "secret"
+	defer func() { serviceToken = "" }()
+
+	mux := buildMux()
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, httptest.NewRequest("GET", "/health", nil))
+	if w.Code != 200 {
+		t.Errorf("health should not require auth, got %d", w.Code)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Model collector tests
 // ---------------------------------------------------------------------------
@@ -104,7 +117,6 @@ func TestModelCollector_HashMismatch(t *testing.T) {
 	dir := t.TempDir()
 	writeTestFile(t, dir, "test-model.gguf", "model-data-here")
 
-	// Start a mock registry that returns a different hash.
 	mockRegistry := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
@@ -147,7 +159,6 @@ func TestModelCollector_HashMatch(t *testing.T) {
 	content := "trusted-model-content"
 	writeTestFile(t, dir, "good-model.gguf", content)
 
-	// Compute expected hash.
 	h := sha256.Sum256([]byte(content))
 	expected := hex.EncodeToString(h[:])
 
@@ -182,7 +193,6 @@ func TestModelCollector_UnknownModel(t *testing.T) {
 	dir := t.TempDir()
 	writeTestFile(t, dir, "rogue-model.gguf", "rogue-data")
 
-	// Registry returns empty list.
 	mockRegistry := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{"models": []map[string]string{}})
@@ -198,6 +208,79 @@ func TestModelCollector_UnknownModel(t *testing.T) {
 	result := collectModelState(cfg)
 	if result.Status != "drift" {
 		t.Fatalf("expected drift for unknown model, got %s", result.Status)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Filesystem hardening tests
+// ---------------------------------------------------------------------------
+
+func TestHashModelFiles_SkipsSymlinks(t *testing.T) {
+	dir := t.TempDir()
+	real := writeTestFile(t, dir, "real.gguf", "data")
+	os.Symlink(real, filepath.Join(dir, "link.gguf"))
+
+	results, err := hashModelFiles(dir, []string{"gguf"}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := results["link.gguf"]; ok {
+		t.Error("symlink should be skipped")
+	}
+	if _, ok := results["real.gguf"]; !ok {
+		t.Error("real file should be hashed")
+	}
+}
+
+func TestHashModelFiles_SkipsOversized(t *testing.T) {
+	dir := t.TempDir()
+	writeTestFile(t, dir, "small.gguf", "ok")
+	writeTestFile(t, dir, "big.gguf", strings.Repeat("x", 200))
+
+	results, err := hashModelFiles(dir, []string{"gguf"}, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := results["big.gguf"]; ok {
+		t.Error("oversized file should be skipped")
+	}
+	if _, ok := results["small.gguf"]; !ok {
+		t.Error("small file should be hashed")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Registry hardening tests
+// ---------------------------------------------------------------------------
+
+func TestFetchRegistry_InvalidScheme(t *testing.T) {
+	_, err := fetchRegistryManifest("ftp://evil.host", "")
+	if err == nil {
+		t.Fatal("expected error for non-http scheme")
+	}
+	if !strings.Contains(err.Error(), "http or https") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestFetchRegistry_AuthHeader(t *testing.T) {
+	var gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{"models": []interface{}{}})
+	}))
+	defer srv.Close()
+
+	os.Setenv("TEST_REG_TOKEN", "my-secret")
+	defer os.Unsetenv("TEST_REG_TOKEN")
+
+	_, err := fetchRegistryManifest(srv.URL, "TEST_REG_TOKEN")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotAuth != "Bearer my-secret" {
+		t.Errorf("expected auth header, got %q", gotAuth)
 	}
 }
 
@@ -246,7 +329,6 @@ func TestPolicyCollector_MissingFile(t *testing.T) {
 	}
 
 	result := collectPolicyState(cfg)
-	// Should report error for the missing file but not crash.
 	found := false
 	for _, f := range result.Findings {
 		if f.Status == "error" {
@@ -255,6 +337,29 @@ func TestPolicyCollector_MissingFile(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("expected error finding for missing file")
+	}
+}
+
+func TestPolicyCollector_RejectsSymlink(t *testing.T) {
+	dir := t.TempDir()
+	real := writeTestFile(t, dir, "real.yaml", "content")
+	link := filepath.Join(dir, "link.yaml")
+	os.Symlink(real, link)
+
+	cfg := PolicyFilesConfig{
+		Files:          map[string]string{"linked": link},
+		ApprovedHashes: map[string]string{},
+	}
+
+	result := collectPolicyState(cfg)
+	found := false
+	for _, f := range result.Findings {
+		if f.Key == "linked" && f.Status == "fail" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("expected fail finding for symlink policy file")
 	}
 }
 
@@ -330,6 +435,114 @@ func TestCompare_AllSkipped(t *testing.T) {
 	}
 }
 
+func TestCompare_CriticalCollectorError_IsFail(t *testing.T) {
+	results := []CollectorResult{
+		{Name: "model", Status: "error", Error: "vault missing"},
+		{Name: "network", Status: "pass"},
+	}
+
+	att := compare(results)
+	if att.Verdict != "fail" {
+		t.Fatalf("expected fail for critical collector error, got %s", att.Verdict)
+	}
+}
+
+func TestCompare_NonCriticalError_IsDrift(t *testing.T) {
+	results := []CollectorResult{
+		{Name: "container", Status: "error", Error: "podman missing"},
+		{Name: "network", Status: "pass"},
+	}
+
+	att := compare(results)
+	if att.Verdict != "drift" {
+		t.Fatalf("expected drift for non-critical error, got %s", att.Verdict)
+	}
+}
+
+func TestCompare_PolicyError_IsFail(t *testing.T) {
+	results := []CollectorResult{
+		{Name: "policy", Status: "error", Error: "cannot hash"},
+		{Name: "network", Status: "pass"},
+	}
+
+	att := compare(results)
+	if att.Verdict != "fail" {
+		t.Fatalf("expected fail for policy collector error, got %s", att.Verdict)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Redaction tests
+// ---------------------------------------------------------------------------
+
+func TestRedactReport_Hostname(t *testing.T) {
+	report := TrustReport{
+		Hostname:    "build-server-01",
+		Attestation: AttestationResult{Verdict: "pass"},
+	}
+
+	redacted := redactReport(report, PrivacyProfile{StripHostname: true})
+	if redacted.Hostname != "[REDACTED]" {
+		t.Errorf("expected hostname redacted, got %s", redacted.Hostname)
+	}
+}
+
+func TestRedactReport_Paths(t *testing.T) {
+	report := TrustReport{
+		Attestation: AttestationResult{
+			Collectors: []CollectorResult{{
+				Name:   "policy",
+				Status: "drift",
+				Findings: []Finding{{
+					Key:    "/etc/secure-ai/policy/fw.yaml",
+					Detail: "file at /home/user/policies/fw.yaml changed",
+					Status: "drift",
+				}},
+			}},
+		},
+	}
+
+	redacted := redactReport(report, PrivacyProfile{StripPaths: true})
+	f := redacted.Attestation.Collectors[0].Findings[0]
+	if strings.Contains(f.Detail, "/home/user") {
+		t.Error("path should be redacted from detail")
+	}
+}
+
+func TestRedactReport_Listeners(t *testing.T) {
+	report := TrustReport{
+		Attestation: AttestationResult{
+			Collectors: []CollectorResult{{
+				Name:   "network",
+				Status: "pass",
+				Findings: []Finding{{
+					Key:    "127.0.0.1:8470",
+					Status: "pass",
+					Detail: "expected listener",
+				}},
+			}},
+		},
+	}
+
+	redacted := redactReport(report, PrivacyProfile{StripListeners: true})
+	f := redacted.Attestation.Collectors[0].Findings[0]
+	if f.Key != "[REDACTED:listener]" {
+		t.Errorf("listener key should be redacted, got %s", f.Key)
+	}
+}
+
+func TestRedactReport_DoesNotMutateOriginal(t *testing.T) {
+	report := TrustReport{
+		Hostname:    "original-host",
+		Attestation: AttestationResult{Verdict: "pass"},
+	}
+
+	redactReport(report, PrivacyProfile{StripHostname: true})
+	if report.Hostname != "original-host" {
+		t.Error("original report should not be mutated")
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Report generation and signing tests
 // ---------------------------------------------------------------------------
@@ -370,12 +583,10 @@ func TestSignAndVerify(t *testing.T) {
 		t.Fatal("expected public key")
 	}
 
-	// Verify with embedded key.
 	if err := verifyReport(signed, ""); err != nil {
 		t.Fatalf("verify with embedded key: %v", err)
 	}
 
-	// Verify with explicit key file.
 	if err := verifyReport(signed, pubPath); err != nil {
 		t.Fatalf("verify with key file: %v", err)
 	}
@@ -391,7 +602,6 @@ func TestVerify_Tampered(t *testing.T) {
 	report := generateReport(att)
 	signed, _ := signReport(report, privPath)
 
-	// Tamper with the report.
 	signed.Attestation.Verdict = "fail"
 
 	err := verifyReport(signed, pubPath)
@@ -470,6 +680,31 @@ func TestMetricsEndpoint(t *testing.T) {
 	var metrics map[string]int64
 	if err := json.Unmarshal(w.Body.Bytes(), &metrics); err != nil {
 		t.Fatalf("invalid JSON: %v", err)
+	}
+}
+
+func TestAllEndpointsRequireAuth(t *testing.T) {
+	serviceToken = "test-secret"
+	defer func() { serviceToken = "" }()
+
+	mux := buildMux()
+
+	endpoints := []struct {
+		method string
+		path   string
+	}{
+		{"GET", "/v1/attest"},
+		{"GET", "/v1/report/latest"},
+		{"POST", "/v1/reload"},
+		{"GET", "/v1/metrics"},
+	}
+
+	for _, ep := range endpoints {
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, httptest.NewRequest(ep.method, ep.path, nil))
+		if w.Code != http.StatusForbidden {
+			t.Errorf("%s %s: expected 403 without token, got %d", ep.method, ep.path, w.Code)
+		}
 	}
 }
 
@@ -552,7 +787,6 @@ func TestGPUCollector_NoDevices(t *testing.T) {
 		DenyUnexpectedDevices: true,
 	}
 	result := collectGPUState(cfg)
-	// On macOS/CI there are typically no NVIDIA devices.
 	if result.Status != "pass" && result.Status != "drift" {
 		t.Fatalf("expected pass or drift, got %s", result.Status)
 	}

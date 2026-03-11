@@ -14,8 +14,12 @@ attestation:
   model:
     vault_dir: /vault/models
     registry_url: http://127.0.0.1:8470
+    # Environment variable holding a bearer token for registry auth (optional)
+    registry_token_env: ""
     allowed_formats:
       - gguf
+    # Max file size in bytes (default 10 GiB). Files larger are skipped.
+    max_file_size: 0
 
   # Container image verification
   container:
@@ -68,7 +72,16 @@ attestation:
   daemon:
     interval_seconds: 300
     bind_addr: "127.0.0.1:8485"
+    read_timeout_seconds: 30
+    write_timeout_seconds: 60
 
   # Rate limiting for daemon API
   rate_limit:
     requests_per_minute: 60
+
+  # Privacy profile: controls what gets stripped from reports and audit logs.
+  privacy:
+    strip_hostname: false
+    strip_paths: false
+    strip_listeners: false
+    strip_policy_names: false
