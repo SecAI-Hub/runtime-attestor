@@ -74,6 +74,7 @@ attestation:
     bind_addr: "127.0.0.1:8485"
     read_timeout_seconds: 30
     write_timeout_seconds: 60
+    idle_timeout_seconds: 120
 
   # Rate limiting for daemon API
   rate_limit:

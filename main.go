@@ -1,7 +1,9 @@
 package main
 
 import (
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -97,6 +99,7 @@ type DaemonConfig struct {
 	BindAddr         string `yaml:"bind_addr"`
 	ReadTimeoutSec   int    `yaml:"read_timeout_seconds"`
 	WriteTimeoutSec  int    `yaml:"write_timeout_seconds"`
+	IdleTimeoutSec   int    `yaml:"idle_timeout_seconds"`
 }
 
 type RateLimitConfig struct {
@@ -122,9 +125,10 @@ var (
 	latestReportMu sync.RWMutex
 	latestReport   *TrustReport
 
-	auditFile *os.File
-	auditMu   sync.Mutex
-	auditPath string
+	auditFile     *os.File
+	auditMu       sync.Mutex
+	auditPath     string
+	auditLastHash string
 
 	rateMu      sync.Mutex
 	rateCounter int64
@@ -184,12 +188,14 @@ func getPolicy() AttestationPolicy {
 // ---------------------------------------------------------------------------
 
 type AuditEntry struct {
-	Timestamp string `json:"timestamp"`
-	Action    string `json:"action"`
-	Verdict   string `json:"verdict,omitempty"`
+	Timestamp string  `json:"timestamp"`
+	Action    string  `json:"action"`
+	Verdict   string  `json:"verdict,omitempty"`
 	Score     float64 `json:"score,omitempty"`
-	Source    string `json:"source,omitempty"`
-	Error     string `json:"error,omitempty"`
+	Source    string  `json:"source,omitempty"`
+	Error     string  `json:"error,omitempty"`
+	Hash      string  `json:"hash"`
+	PrevHash  string  `json:"prev_hash,omitempty"`
 }
 
 func initAuditLog() {
@@ -197,10 +203,29 @@ func initAuditLog() {
 	if auditPath == "" {
 		auditPath = defaultAuditPath
 	}
-	if err := os.MkdirAll(auditPath[:strings.LastIndex(auditPath, "/")], 0750); err != nil {
-		log.Printf("warning: cannot create audit dir: %v", err)
-		return
+	idx := strings.LastIndex(auditPath, "/")
+	if idx > 0 {
+		if err := os.MkdirAll(auditPath[:idx], 0750); err != nil {
+			log.Printf("warning: cannot create audit dir: %v", err)
+			return
+		}
 	}
+
+	// Load last hash from existing audit log for chain continuity.
+	if data, err := os.ReadFile(auditPath); err == nil {
+		lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+		for i := len(lines) - 1; i >= 0; i-- {
+			if lines[i] == "" {
+				continue
+			}
+			var entry AuditEntry
+			if err := json.Unmarshal([]byte(lines[i]), &entry); err == nil {
+				auditLastHash = entry.Hash
+				break
+			}
+		}
+	}
+
 	f, err := os.OpenFile(auditPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0640)
 	if err != nil {
 		log.Printf("warning: cannot open audit log: %v", err)
@@ -209,15 +234,44 @@ func initAuditLog() {
 	auditFile = f
 }
 
+// computeAuditHash returns a SHA-256 digest over all fields except Hash.
+func computeAuditHash(entry AuditEntry) string {
+	canonical := struct {
+		Timestamp string  `json:"timestamp"`
+		Action    string  `json:"action"`
+		Verdict   string  `json:"verdict,omitempty"`
+		Score     float64 `json:"score,omitempty"`
+		Source    string  `json:"source,omitempty"`
+		Error     string  `json:"error,omitempty"`
+		PrevHash  string  `json:"prev_hash,omitempty"`
+	}{
+		Timestamp: entry.Timestamp,
+		Action:    entry.Action,
+		Verdict:   entry.Verdict,
+		Score:     entry.Score,
+		Source:    entry.Source,
+		Error:     entry.Error,
+		PrevHash:  entry.PrevHash,
+	}
+	data, _ := json.Marshal(canonical)
+	h := sha256.Sum256(data)
+	return hex.EncodeToString(h[:])
+}
+
 func writeAudit(entry AuditEntry) {
 	if auditFile == nil {
 		return
 	}
 	entry.Timestamp = time.Now().UTC().Format(time.RFC3339)
+	entry.PrevHash = auditLastHash
+	entry.Hash = computeAuditHash(entry)
+	auditLastHash = entry.Hash
+
 	data, _ := json.Marshal(entry)
 	auditMu.Lock()
 	defer auditMu.Unlock()
 	auditFile.Write(append(data, '\n'))
+	auditFile.Sync()
 }
 
 // ---------------------------------------------------------------------------
@@ -462,12 +516,17 @@ func runDaemon(bindAddr string, interval time.Duration) {
 	if writeTimeout <= 0 {
 		writeTimeout = 60
 	}
+	idleTimeout := pol.Attestation.Daemon.IdleTimeoutSec
+	if idleTimeout <= 0 {
+		idleTimeout = 120
+	}
 
 	srv := &http.Server{
 		Addr:         bindAddr,
 		Handler:      mux,
 		ReadTimeout:  time.Duration(readTimeout) * time.Second,
 		WriteTimeout: time.Duration(writeTimeout) * time.Second,
+		IdleTimeout:  time.Duration(idleTimeout) * time.Second,
 	}
 
 	log.Printf("runtime-attestor daemon listening on %s", bindAddr)

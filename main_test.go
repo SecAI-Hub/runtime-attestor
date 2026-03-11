@@ -812,3 +812,107 @@ func TestSHA256File(t *testing.T) {
 		t.Fatalf("expected %s, got %s", expectedHex, hash)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Audit hash chain tests
+// ---------------------------------------------------------------------------
+
+func TestAuditHashChain(t *testing.T) {
+	dir := t.TempDir()
+	auditPath = dir + "/audit.jsonl"
+	auditLastHash = ""
+
+	f, err := os.OpenFile(auditPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0640)
+	if err != nil {
+		t.Fatal(err)
+	}
+	auditFile = f
+	defer func() {
+		auditFile.Close()
+		auditFile = nil
+		auditLastHash = ""
+	}()
+
+	// Write several audit entries.
+	writeAudit(AuditEntry{Action: "attestation", Verdict: "pass", Score: 1.0})
+	writeAudit(AuditEntry{Action: "attestation", Verdict: "drift", Score: 0.75})
+	writeAudit(AuditEntry{Action: "attestation", Verdict: "pass", Score: 1.0})
+
+	// Read back and verify chain.
+	data, _ := os.ReadFile(auditPath)
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("expected 3 audit entries, got %d", len(lines))
+	}
+
+	var entries []AuditEntry
+	for _, line := range lines {
+		var entry AuditEntry
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		entries = append(entries, entry)
+	}
+
+	// First entry should have empty prev_hash.
+	if entries[0].PrevHash != "" {
+		t.Fatalf("first entry should have empty prev_hash, got %s", entries[0].PrevHash)
+	}
+
+	// All hashes should be non-empty.
+	for i, e := range entries {
+		if e.Hash == "" {
+			t.Fatalf("entry %d has empty hash", i)
+		}
+	}
+
+	// Subsequent entries should chain.
+	for i := 1; i < len(entries); i++ {
+		if entries[i].PrevHash != entries[i-1].Hash {
+			t.Fatalf("chain broken at entry %d: prev_hash=%s, expected %s",
+				i, entries[i].PrevHash, entries[i-1].Hash)
+		}
+	}
+
+	// Verify hash integrity by recomputing.
+	for i, e := range entries {
+		expected := computeAuditHash(e)
+		if e.Hash != expected {
+			t.Fatalf("hash mismatch at entry %d: got %s, expected %s", i, e.Hash, expected)
+		}
+	}
+}
+
+func TestAuditHashChain_TamperDetection(t *testing.T) {
+	dir := t.TempDir()
+	auditPath = dir + "/audit.jsonl"
+	auditLastHash = ""
+
+	f, _ := os.OpenFile(auditPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0640)
+	auditFile = f
+	defer func() {
+		auditFile.Close()
+		auditFile = nil
+		auditLastHash = ""
+	}()
+
+	writeAudit(AuditEntry{Action: "attestation", Verdict: "pass", Score: 1.0})
+	writeAudit(AuditEntry{Action: "attestation", Verdict: "drift", Score: 0.75})
+
+	data, _ := os.ReadFile(auditPath)
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+
+	var entries []AuditEntry
+	for _, line := range lines {
+		var e AuditEntry
+		json.Unmarshal([]byte(line), &e)
+		entries = append(entries, e)
+	}
+
+	// Tamper with verdict.
+	entries[0].Verdict = "TAMPERED"
+	recomputed := computeAuditHash(entries[0])
+	if recomputed == entries[0].Hash {
+		t.Fatal("hash should differ after tampering")
+	}
+}
