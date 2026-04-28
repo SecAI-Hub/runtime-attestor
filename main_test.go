@@ -218,7 +218,9 @@ func TestModelCollector_UnknownModel(t *testing.T) {
 func TestHashModelFiles_SkipsSymlinks(t *testing.T) {
 	dir := t.TempDir()
 	real := writeTestFile(t, dir, "real.gguf", "data")
-	os.Symlink(real, filepath.Join(dir, "link.gguf"))
+	if err := os.Symlink(real, filepath.Join(dir, "link.gguf")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
 
 	results, err := hashModelFiles(dir, []string{"gguf"}, 0)
 	if err != nil {
@@ -344,7 +346,9 @@ func TestPolicyCollector_RejectsSymlink(t *testing.T) {
 	dir := t.TempDir()
 	real := writeTestFile(t, dir, "real.yaml", "content")
 	link := filepath.Join(dir, "link.yaml")
-	os.Symlink(real, link)
+	if err := os.Symlink(real, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
 
 	cfg := PolicyFilesConfig{
 		Files:          map[string]string{"linked": link},
