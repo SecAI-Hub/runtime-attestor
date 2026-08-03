@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -10,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // ---------------------------------------------------------------------------
@@ -17,6 +19,9 @@ import (
 // ---------------------------------------------------------------------------
 
 func setupTestPolicy() {
+	auditRequired.Store(false)
+	auditHealthy.Store(false)
+	persistReports.Store(false)
 	policyMu.Lock()
 	policy = AttestationPolicy{
 		Version: 1,
@@ -94,8 +99,13 @@ func TestHealthEndpoint_NoAuthRequired(t *testing.T) {
 
 func TestModelCollector_EmptyVault(t *testing.T) {
 	dir := t.TempDir()
+	mockRegistry := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"models": []any{}})
+	}))
+	defer mockRegistry.Close()
 	cfg := ModelConfig{
 		VaultDir:       dir,
+		RegistryURL:    mockRegistry.URL,
 		AllowedFormats: []string{"gguf"},
 	}
 
@@ -215,7 +225,7 @@ func TestModelCollector_UnknownModel(t *testing.T) {
 // Filesystem hardening tests
 // ---------------------------------------------------------------------------
 
-func TestHashModelFiles_SkipsSymlinks(t *testing.T) {
+func TestHashModelFiles_RejectsSymlinks(t *testing.T) {
 	dir := t.TempDir()
 	real := writeTestFile(t, dir, "real.gguf", "data")
 	if err := os.Symlink(real, filepath.Join(dir, "link.gguf")); err != nil {
@@ -223,31 +233,19 @@ func TestHashModelFiles_SkipsSymlinks(t *testing.T) {
 	}
 
 	results, err := hashModelFiles(dir, []string{"gguf"}, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := results["link.gguf"]; ok {
-		t.Error("symlink should be skipped")
-	}
-	if _, ok := results["real.gguf"]; !ok {
-		t.Error("real file should be hashed")
+	if err == nil || results != nil {
+		t.Fatal("matching symlink must make collection fail closed")
 	}
 }
 
-func TestHashModelFiles_SkipsOversized(t *testing.T) {
+func TestHashModelFiles_RejectsOversized(t *testing.T) {
 	dir := t.TempDir()
 	writeTestFile(t, dir, "small.gguf", "ok")
 	writeTestFile(t, dir, "big.gguf", strings.Repeat("x", 200))
 
 	results, err := hashModelFiles(dir, []string{"gguf"}, 100)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := results["big.gguf"]; ok {
-		t.Error("oversized file should be skipped")
-	}
-	if _, ok := results["small.gguf"]; !ok {
-		t.Error("small file should be hashed")
+	if err == nil || results != nil {
+		t.Fatal("oversized matching model must make collection fail closed")
 	}
 }
 
@@ -413,18 +411,18 @@ func TestCompare_Fail(t *testing.T) {
 	}
 }
 
-func TestCompare_SkippedIgnored(t *testing.T) {
+func TestCompare_SkippedFailsClosed(t *testing.T) {
 	results := []CollectorResult{
 		{Name: "a", Status: "pass"},
 		{Name: "b", Status: "skipped"},
 	}
 
 	att := compare(results)
-	if att.Verdict != "pass" {
-		t.Fatalf("expected pass (skipped ignored), got %s", att.Verdict)
+	if att.Verdict != "fail" {
+		t.Fatalf("expected fail for missing evidence, got %s", att.Verdict)
 	}
-	if att.Score != 1.0 {
-		t.Fatalf("expected score 1.0, got %.2f", att.Score)
+	if att.Score != 0.5 {
+		t.Fatalf("expected score 0.5, got %.2f", att.Score)
 	}
 }
 
@@ -434,8 +432,8 @@ func TestCompare_AllSkipped(t *testing.T) {
 	}
 
 	att := compare(results)
-	if att.Score != 1.0 {
-		t.Fatalf("expected 1.0 for all-skipped, got %.2f", att.Score)
+	if att.Score != 0.0 || att.Verdict != "fail" {
+		t.Fatalf("expected fail/0.0 for all-skipped, got %s/%.2f", att.Verdict, att.Score)
 	}
 }
 
@@ -451,15 +449,15 @@ func TestCompare_CriticalCollectorError_IsFail(t *testing.T) {
 	}
 }
 
-func TestCompare_NonCriticalError_IsDrift(t *testing.T) {
+func TestCompare_NonCriticalError_IsFailClosed(t *testing.T) {
 	results := []CollectorResult{
 		{Name: "container", Status: "error", Error: "podman missing"},
 		{Name: "network", Status: "pass"},
 	}
 
 	att := compare(results)
-	if att.Verdict != "drift" {
-		t.Fatalf("expected drift for non-critical error, got %s", att.Verdict)
+	if att.Verdict != "fail" {
+		t.Fatalf("expected fail for unavailable evidence, got %s", att.Verdict)
 	}
 }
 
@@ -587,8 +585,8 @@ func TestSignAndVerify(t *testing.T) {
 		t.Fatal("expected public key")
 	}
 
-	if err := verifyReport(signed, ""); err != nil {
-		t.Fatalf("verify with embedded key: %v", err)
+	if err := verifyReport(signed, ""); err == nil {
+		t.Fatal("embedded key must not be accepted as a trust anchor")
 	}
 
 	if err := verifyReport(signed, pubPath); err != nil {
@@ -611,6 +609,29 @@ func TestVerify_Tampered(t *testing.T) {
 	err := verifyReport(signed, pubPath)
 	if err == nil {
 		t.Fatal("expected verification to fail on tampered report")
+	}
+}
+
+func TestGenerateKeypairRefusesOverwrite(t *testing.T) {
+	dir := t.TempDir()
+	privPath := filepath.Join(dir, "test.key")
+	pubPath := filepath.Join(dir, "test.pub")
+	if err := generateKeypair(privPath, pubPath); err != nil {
+		t.Fatalf("first keygen: %v", err)
+	}
+	before, err := os.ReadFile(privPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := generateKeypair(privPath, filepath.Join(dir, "second.pub")); err == nil {
+		t.Fatal("key generation must not overwrite an existing private key")
+	}
+	after, err := os.ReadFile(privPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("existing private key changed")
 	}
 }
 
@@ -716,7 +737,7 @@ func TestAllEndpointsRequireAuth(t *testing.T) {
 // Service token auth tests
 // ---------------------------------------------------------------------------
 
-func TestServiceToken_DevMode(t *testing.T) {
+func TestServiceToken_MissingFailsClosed(t *testing.T) {
 	serviceToken = ""
 	called := false
 	handler := requireServiceToken(func(w http.ResponseWriter, r *http.Request) {
@@ -728,8 +749,49 @@ func TestServiceToken_DevMode(t *testing.T) {
 	w := httptest.NewRecorder()
 	handler(w, req)
 
-	if !called {
-		t.Fatal("handler should be called in dev mode")
+	if called {
+		t.Fatal("handler must not be called without configured authentication")
+	}
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d", w.Code)
+	}
+}
+
+func TestLoadServiceTokenRequiresOwnerOnlyFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "service-token")
+	if err := os.WriteFile(path, []byte(strings.Repeat("x", 32)), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SERVICE_TOKEN_PATH", path)
+	if err := loadServiceToken(); err == nil {
+		t.Fatal("group/world-readable token must be rejected")
+	}
+	if err := os.Chmod(path, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := loadServiceToken(); err != nil {
+		t.Fatalf("owner-only token rejected: %v", err)
+	}
+	serviceToken = ""
+}
+
+func TestRunAttestation_ConfiguredSigningFailureFailsClosed(t *testing.T) {
+	setupTestPolicy()
+	policyMu.Lock()
+	policy.Attestation.Report.SigningKey = filepath.Join(t.TempDir(), "missing.key")
+	policyMu.Unlock()
+	report := runAttestation()
+	if report.Attestation.Verdict != "fail" || report.Signature != "" {
+		t.Fatalf("configured signing failure must produce unsigned fail verdict")
+	}
+	found := false
+	for _, collector := range report.Attestation.Collectors {
+		if collector.Name == "report-signing" && collector.Status == "error" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("missing report-signing failure evidence")
 	}
 }
 
@@ -781,6 +843,15 @@ func TestMountCollector_NoExpected(t *testing.T) {
 	}
 }
 
+func TestMountReadonlyOptionRequiresExactToken(t *testing.T) {
+	if !hasMountOption("ro,nosuid,nodev", "ro") {
+		t.Fatal("exact ro option was not detected")
+	}
+	if hasMountOption("rw,errors=remount-ro", "ro") {
+		t.Fatal("errors=remount-ro must not be treated as a read-only mount")
+	}
+}
+
 // ---------------------------------------------------------------------------
 // GPU collector tests
 // ---------------------------------------------------------------------------
@@ -826,15 +897,19 @@ func TestAuditHashChain(t *testing.T) {
 	auditPath = dir + "/audit.jsonl"
 	auditLastHash = ""
 
-	f, err := os.OpenFile(auditPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0640)
+	f, err := os.OpenFile(auditPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
 	if err != nil {
 		t.Fatal(err)
 	}
 	auditFile = f
+	auditRequired.Store(true)
+	auditHealthy.Store(true)
 	defer func() {
 		auditFile.Close()
 		auditFile = nil
 		auditLastHash = ""
+		auditRequired.Store(false)
+		auditHealthy.Store(false)
 	}()
 
 	// Write several audit entries.
@@ -892,12 +967,16 @@ func TestAuditHashChain_TamperDetection(t *testing.T) {
 	auditPath = dir + "/audit.jsonl"
 	auditLastHash = ""
 
-	f, _ := os.OpenFile(auditPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0640)
+	f, _ := os.OpenFile(auditPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
 	auditFile = f
+	auditRequired.Store(true)
+	auditHealthy.Store(true)
 	defer func() {
 		auditFile.Close()
 		auditFile = nil
 		auditLastHash = ""
+		auditRequired.Store(false)
+		auditHealthy.Store(false)
 	}()
 
 	writeAudit(AuditEntry{Action: "attestation", Verdict: "pass", Score: 1.0})
@@ -918,5 +997,186 @@ func TestAuditHashChain_TamperDetection(t *testing.T) {
 	recomputed := computeAuditHash(entries[0])
 	if recomputed == entries[0].Hash {
 		t.Fatal("hash should differ after tampering")
+	}
+}
+
+func TestRunAttestation_ConfiguredSigningSucceeds(t *testing.T) {
+	setupTestPolicy()
+	dir := t.TempDir()
+	privateKey := filepath.Join(dir, "attestor.key")
+	publicKey := filepath.Join(dir, "attestor.pub")
+	if err := generateKeypair(privateKey, publicKey); err != nil {
+		t.Fatal(err)
+	}
+	policyMu.Lock()
+	policy.Attestation.Report.SigningKey = privateKey
+	policyMu.Unlock()
+	report := runAttestation()
+	if report.Signature == "" || report.SignedAt == "" {
+		t.Fatal("configured signing key must produce a signed report")
+	}
+	if err := verifyReport(report, publicKey); err != nil {
+		t.Fatalf("signed attestation did not verify: %v", err)
+	}
+}
+
+func TestVerifyReport_RejectsTimestampTampering(t *testing.T) {
+	dir := t.TempDir()
+	privateKey := filepath.Join(dir, "attestor.key")
+	publicKey := filepath.Join(dir, "attestor.pub")
+	if err := generateKeypair(privateKey, publicKey); err != nil {
+		t.Fatal(err)
+	}
+	report, err := signReport(generateReport(AttestationResult{Verdict: "pass", Score: 1}), privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	report.SignedAt = time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano)
+	if err := verifyReport(report, publicKey); err == nil {
+		t.Fatal("signed_at tampering must invalidate the signature")
+	}
+}
+
+func TestLoadPolicy_StrictAndRequiresCollectors(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "policy.yaml")
+	t.Setenv("POLICY_PATH", path)
+	if err := os.WriteFile(path, []byte("version: 1\nunknown: true\nattestation: {}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := loadPolicy(); err == nil {
+		t.Fatal("unknown policy fields must be rejected")
+	}
+	if err := os.WriteFile(path, []byte("version: 1\nattestation:\n  collectors: {}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := loadPolicy(); err == nil {
+		t.Fatal("policy without enabled collectors must be rejected")
+	}
+}
+
+func TestInitAuditLog_RejectsTamperedChain(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "audit.jsonl")
+	entry := AuditEntry{Timestamp: time.Now().UTC().Format(time.RFC3339), Action: "test", Hash: "not-a-valid-hash"}
+	data, _ := json.Marshal(entry)
+	if err := os.WriteFile(path, append(data, '\n'), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AUDIT_LOG_PATH", path)
+	auditFile = nil
+	auditLastHash = ""
+	t.Cleanup(func() {
+		auditRequired.Store(false)
+		auditHealthy.Store(false)
+	})
+	if err := initAuditLog(); err == nil {
+		t.Fatal("tampered audit chain must prevent startup")
+	}
+}
+
+func TestVerifyRuntimeAuditRejectsUnknownAndTrailingJSON(t *testing.T) {
+	dir := t.TempDir()
+	entry := AuditEntry{Timestamp: time.Now().UTC().Format(time.RFC3339Nano), Action: "test"}
+	entry.Hash = computeAuditHash(entry)
+	data, err := json.Marshal(entry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, line := range map[string][]byte{
+		"unknown":  append(append([]byte{}, data[:len(data)-1]...), []byte(`,"unexpected":true}`)...),
+		"trailing": append(append([]byte{}, data...), []byte(` {}`)...),
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(dir, name+".jsonl")
+			if err := os.WriteFile(path, append(line, '\n'), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := verifyRuntimeAudit(path); err == nil {
+				t.Fatal("non-strict audit JSON must be rejected")
+			}
+		})
+	}
+}
+
+func TestRuntimeAuditWriteFailurePoisonsHealth(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	auditFile = f
+	auditRequired.Store(true)
+	auditHealthy.Store(true)
+	auditLastHash = ""
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		auditFile = nil
+		auditRequired.Store(false)
+		auditHealthy.Store(false)
+		auditLastHash = ""
+	})
+	if err := writeAudit(AuditEntry{Action: "test"}); err == nil {
+		t.Fatal("closed audit file must fail")
+	}
+	if auditAvailable() {
+		t.Fatal("audit failure must poison service health")
+	}
+}
+
+func TestPersistTrustReportWritesSignedOwnerOnlyArtifact(t *testing.T) {
+	dir := t.TempDir()
+	privateKey := filepath.Join(dir, "attestor.key")
+	publicKey := filepath.Join(dir, "attestor.pub")
+	if err := generateKeypair(privateKey, publicKey); err != nil {
+		t.Fatal(err)
+	}
+	report, err := signReport(generateReport(AttestationResult{Verdict: "pass", Score: 1}), privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outputDir := filepath.Join(dir, "reports")
+	if err := persistTrustReport(report, ReportConfig{OutputDir: outputDir, Format: "pretty"}); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(outputDir)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("expected one persisted report: entries=%d err=%v", len(entries), err)
+	}
+	path := filepath.Join(outputDir, entries[0].Name())
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0600 {
+		t.Fatalf("persisted report must be owner-only: mode=%v", info.Mode().Perm())
+	}
+	persistedData, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var persisted TrustReport
+	if err := json.Unmarshal(persistedData, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyReport(persisted, publicKey); err != nil {
+		t.Fatalf("persisted report signature is invalid: %v", err)
+	}
+}
+
+func TestLoadPolicyRejectsGroupWritableFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "policy.yaml")
+	content := "version: 1\nattestation:\n  collectors:\n    model: true\n"
+	if err := os.WriteFile(path, []byte(content), 0620); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0620); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("POLICY_PATH", path)
+	if err := loadPolicy(); err == nil {
+		t.Fatal("group-writable policy must be rejected")
 	}
 }

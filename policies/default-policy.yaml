@@ -18,7 +18,7 @@ attestation:
     registry_token_env: ""
     allowed_formats:
       - gguf
-    # Max file size in bytes (default 10 GiB). Files larger are skipped.
+    # Max file size in bytes (default 10 GiB). Oversized files fail collection.
     max_file_size: 0
 
   # Container image verification

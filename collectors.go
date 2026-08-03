@@ -1,12 +1,16 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,6 +18,46 @@ import (
 	"strings"
 	"time"
 )
+
+const (
+	collectorCommandTimeout = 5 * time.Second
+	maxCommandOutput        = 1 << 20
+	maxProcEvidence         = 8 << 20
+	maxPolicyEvidence       = 64 << 20
+	maxModelFiles           = 10000
+)
+
+type boundedBuffer struct {
+	bytes.Buffer
+	limit int
+}
+
+func (b *boundedBuffer) Write(p []byte) (int, error) {
+	if len(p) > b.limit-b.Len() {
+		return 0, fmt.Errorf("command output exceeds %d bytes", b.limit)
+	}
+	return b.Buffer.Write(p)
+}
+
+func runBoundedCommand(name string, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), collectorCommandTimeout)
+	defer cancel()
+	stdout := &boundedBuffer{limit: maxCommandOutput}
+	stderr := &boundedBuffer{limit: maxCommandOutput}
+	// #nosec G204 -- callers supply only policy-validated podman/docker, fixed mount, or LookPath-resolved ss/netstat/GPU utility names with fixed argument shapes; no shell is used.
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Stdin = nil
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	err := cmd.Run()
+	if ctx.Err() != nil {
+		return nil, fmt.Errorf("command timed out")
+	}
+	if err != nil {
+		return nil, fmt.Errorf("command failed: %w", err)
+	}
+	return stdout.Bytes(), nil
+}
 
 // ---------------------------------------------------------------------------
 // Collector types
@@ -71,35 +115,28 @@ func collectModelState(cfg ModelConfig) CollectorResult {
 		return result
 	}
 
-	if len(localModels) == 0 {
-		result.Status = "pass"
-		result.Findings = append(result.Findings, Finding{
-			Key:    "vault_models",
-			Status: "pass",
-			Detail: "no model files found in vault (clean state)",
-		})
-		return result
-	}
-
-	// Fetch approved manifest from registry if available.
+	// The registry is authoritative even for an empty vault; otherwise missing
+	// approved models could be misreported as a clean state.
 	approved, err := fetchRegistryManifest(cfg.RegistryURL, cfg.RegistryTokenEnv)
 	if err != nil {
-		// Registry unavailable — report local hashes without comparison.
-		for filename, hash := range localModels {
-			result.Findings = append(result.Findings, Finding{
-				Key:    filename,
-				Actual: hash,
-				Status: "drift",
-				Detail: fmt.Sprintf("registry unavailable (%v); cannot verify", err),
-			})
-		}
-		result.Status = "drift"
+		result.Status = "error"
+		result.Error = fmt.Sprintf("registry evidence unavailable: %v", err)
 		return result
 	}
 
 	// Build approved lookup: filename -> sha256.
 	approvedMap := make(map[string]string)
 	for _, m := range approved {
+		if m.Filename == "" || filepath.Base(m.Filename) != m.Filename || !validSHA256(m.SHA256) {
+			result.Status = "error"
+			result.Error = "registry manifest contains an invalid filename or digest"
+			return result
+		}
+		if _, exists := approvedMap[m.Filename]; exists {
+			result.Status = "error"
+			result.Error = "registry manifest contains duplicate filenames"
+			return result
+		}
 		approvedMap[m.Filename] = m.SHA256
 	}
 
@@ -110,7 +147,7 @@ func collectModelState(cfg ModelConfig) CollectorResult {
 			result.Findings = append(result.Findings, Finding{
 				Key:    filename,
 				Actual: actualHash,
-				Status: "drift",
+				Status: "fail",
 				Detail: "model file not in approved registry manifest",
 			})
 			hasDrift = true
@@ -134,6 +171,15 @@ func collectModelState(cfg ModelConfig) CollectorResult {
 			Status:   "pass",
 		})
 	}
+	for filename, expectedHash := range approvedMap {
+		if _, exists := localModels[filename]; !exists {
+			result.Findings = append(result.Findings, Finding{
+				Key: filename, Expected: expectedHash, Actual: "missing", Status: "fail",
+				Detail: "approved model is missing from the vault",
+			})
+			hasDrift = true
+		}
+	}
 
 	if hasDrift {
 		result.Status = "drift"
@@ -141,6 +187,14 @@ func collectModelState(cfg ModelConfig) CollectorResult {
 		result.Status = "pass"
 	}
 	return result
+}
+
+func validSHA256(value string) bool {
+	if len(value) != sha256.Size*2 || strings.ToLower(value) != value {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
 }
 
 // defaultMaxModelSize is 10 GiB.
@@ -163,15 +217,18 @@ func hashModelFiles(dir string, formats []string, maxSize int64) (map[string]str
 	if err != nil {
 		return nil, err
 	}
+	if len(entries) > maxModelFiles {
+		return nil, fmt.Errorf("vault contains more than %d entries", maxModelFiles)
+	}
 
 	for _, entry := range entries {
 		if entry.IsDir() {
-			continue
+			return nil, fmt.Errorf("model vault must be flat; directory %q is not attested", entry.Name())
 		}
 
-		// Reject symlinks
+		// Unsafe matching entries are evidence failures, not invisible files.
 		if entry.Type()&os.ModeSymlink != 0 {
-			continue
+			return nil, fmt.Errorf("model entry %q is a symlink", entry.Name())
 		}
 
 		ext := strings.ToLower(filepath.Ext(entry.Name()))
@@ -184,18 +241,18 @@ func hashModelFiles(dir string, formats []string, maxSize int64) (map[string]str
 		// Use Lstat to detect symlinks that ReadDir may not flag
 		info, err := os.Lstat(path)
 		if err != nil {
-			continue
+			return nil, fmt.Errorf("stat model %q: %w", entry.Name(), err)
 		}
 		// Reject non-regular files (symlinks, devices, FIFOs, sockets)
 		if !info.Mode().IsRegular() {
-			continue
+			return nil, fmt.Errorf("model entry %q is not a regular file", entry.Name())
 		}
 		// Enforce max file size
 		if info.Size() > maxSize {
-			continue
+			return nil, fmt.Errorf("model entry %q exceeds size limit", entry.Name())
 		}
 
-		hash, err := sha256File(path)
+		hash, err := sha256FileBounded(path, maxSize)
 		if err != nil {
 			return nil, fmt.Errorf("hash %s: %w", entry.Name(), err)
 		}
@@ -206,14 +263,38 @@ func hashModelFiles(dir string, formats []string, maxSize int64) (map[string]str
 
 // sha256File computes the SHA-256 hex digest of a file.
 func sha256File(path string) (string, error) {
+	return sha256FileBounded(path, defaultMaxModelSize)
+}
+
+func sha256FileBounded(path string, limit int64) (string, error) {
+	before, err := os.Lstat(path)
+	if err != nil {
+		return "", err
+	}
+	if !before.Mode().IsRegular() || before.Mode()&os.ModeSymlink != 0 || before.Size() < 0 || before.Size() > limit {
+		return "", fmt.Errorf("not a regular non-symlink file")
+	}
+	// #nosec G304 -- path was Lstat-validated as a bounded regular non-symlink and is identity-checked after open.
 	f, err := os.Open(path)
 	if err != nil {
 		return "", err
 	}
 	defer f.Close()
+	opened, err := f.Stat()
+	if err != nil || !os.SameFile(before, opened) {
+		return "", fmt.Errorf("file changed while opening")
+	}
 	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
+	written, err := io.Copy(h, io.LimitReader(f, limit+1))
+	if err != nil {
 		return "", err
+	}
+	if written > limit {
+		return "", fmt.Errorf("file exceeds size limit")
+	}
+	after, err := f.Stat()
+	if err != nil || !os.SameFile(opened, after) || after.Size() != opened.Size() || written != opened.Size() {
+		return "", fmt.Errorf("file changed while hashing")
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
@@ -228,22 +309,33 @@ func fetchRegistryManifest(registryURL, tokenEnv string) ([]RegistryModel, error
 		return nil, fmt.Errorf("registry_url not configured")
 	}
 
-	// Basic URL validation: must start with http:// or https://
-	if !strings.HasPrefix(registryURL, "http://") && !strings.HasPrefix(registryURL, "https://") {
-		return nil, fmt.Errorf("registry_url must use http or https scheme: %q", registryURL)
+	baseURL, err := parseRegistryURL(registryURL)
+	if err != nil {
+		return nil, err
 	}
+	baseURL.Path = strings.TrimRight(baseURL.Path, "/") + "/v1/models"
 
-	client := &http.Client{Timeout: 5 * time.Second}
-	req, err := http.NewRequest(http.MethodGet, registryURL+"/v1/models", nil)
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 3 || len(via) == 0 || req.URL.Scheme != via[0].URL.Scheme || req.URL.Host != via[0].URL.Host {
+				return fmt.Errorf("cross-origin or excessive redirect refused")
+			}
+			return nil
+		},
+	}
+	req, err := http.NewRequest(http.MethodGet, baseURL.String(), nil)
 	if err != nil {
 		return nil, fmt.Errorf("build registry request: %w", err)
 	}
 
 	// Add auth header if configured
 	if tokenEnv != "" {
-		if tok := os.Getenv(tokenEnv); tok != "" {
-			req.Header.Set("Authorization", "Bearer "+tok)
+		tok := strings.TrimSpace(os.Getenv(tokenEnv))
+		if tok == "" {
+			return nil, fmt.Errorf("registry credential environment variable %q is empty", tokenEnv)
 		}
+		req.Header.Set("Authorization", "Bearer "+tok)
 	}
 
 	resp, err := client.Do(req)
@@ -256,14 +348,55 @@ func fetchRegistryManifest(registryURL, tokenEnv string) ([]RegistryModel, error
 		return nil, fmt.Errorf("registry returned %d", resp.StatusCode)
 	}
 
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxRegistryResponse+1))
+	if err != nil {
+		return nil, fmt.Errorf("read registry response: %w", err)
+	}
+	if len(body) > maxRegistryResponse {
+		return nil, fmt.Errorf("registry response exceeds %d bytes", maxRegistryResponse)
+	}
 	var envelope struct {
 		Models []RegistryModel `json:"models"`
 	}
-	// Limit response body to prevent unbounded reads
-	if err := json.NewDecoder(io.LimitReader(resp.Body, maxRegistryResponse)).Decode(&envelope); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&envelope); err != nil {
 		return nil, fmt.Errorf("decode registry response: %w", err)
 	}
+	if err := ensureJSONEOF(decoder); err != nil {
+		return nil, fmt.Errorf("decode registry response: %w", err)
+	}
+	if len(envelope.Models) > 10000 {
+		return nil, fmt.Errorf("registry manifest contains too many models")
+	}
 	return envelope.Models, nil
+}
+
+func parseRegistryURL(raw string) (*url.URL, error) {
+	parsed, err := url.Parse(raw)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") ||
+		parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return nil, fmt.Errorf("registry_url must use http or https and contain no credentials, query, or fragment")
+	}
+	if parsed.Scheme == "http" {
+		host := parsed.Hostname()
+		ip := net.ParseIP(host)
+		if host != "localhost" && (ip == nil || !ip.IsLoopback()) {
+			return nil, fmt.Errorf("unencrypted registry_url is limited to loopback")
+		}
+	}
+	return parsed, nil
+}
+
+func ensureJSONEOF(decoder *json.Decoder) error {
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("trailing JSON value")
+		}
+		return err
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -281,6 +414,11 @@ func collectContainerState(cfg ContainerConfig) CollectorResult {
 	if rt == "" {
 		rt = "podman"
 	}
+	if len(cfg.ExpectedImages) == 0 {
+		result.Status = "error"
+		result.Error = "no expected container images configured"
+		return result
+	}
 
 	// Check if runtime is available.
 	if _, err := exec.LookPath(rt); err != nil {
@@ -290,7 +428,7 @@ func collectContainerState(cfg ContainerConfig) CollectorResult {
 	}
 
 	// List running containers: output image digests.
-	out, err := exec.Command(rt, "ps", "--format", "{{.Image}}|||{{.Names}}|||{{.ID}}").Output()
+	out, err := runBoundedCommand(rt, "ps", "--format", "{{.Image}}|||{{.Names}}|||{{.ID}}")
 	if err != nil {
 		result.Status = "error"
 		result.Error = fmt.Sprintf("%s ps: %v", rt, err)
@@ -330,7 +468,7 @@ func collectContainerState(cfg ContainerConfig) CollectorResult {
 			result.Findings = append(result.Findings, Finding{
 				Key:    key,
 				Actual: image,
-				Status: "drift",
+				Status: "fail",
 				Detail: "unexpected container image",
 			})
 			hasDrift = true
@@ -385,7 +523,7 @@ func collectNetworkState(cfg NetworkConfig) CollectorResult {
 		} else if cfg.DenyUnexpectedListeners {
 			result.Findings = append(result.Findings, Finding{
 				Key:    listener,
-				Status: "drift",
+				Status: "fail",
 				Detail: "unexpected listener — not in allowed list",
 			})
 			hasDrift = true
@@ -429,10 +567,13 @@ func getListeners() ([]string, error) {
 // getListenersLinux parses /proc/net/tcp and /proc/net/tcp6.
 func getListenersLinux() ([]string, error) {
 	var listeners []string
-	for _, path := range []string{"/proc/net/tcp", "/proc/net/tcp6"} {
-		data, err := os.ReadFile(path)
+	for index, path := range []string{"/proc/net/tcp", "/proc/net/tcp6"} {
+		data, err := readPseudoFile(path, maxProcEvidence)
 		if err != nil {
-			continue
+			if index == 1 && os.IsNotExist(err) {
+				continue
+			}
+			return nil, fmt.Errorf("read network evidence: %w", err)
 		}
 		lines := strings.Split(string(data), "\n")
 		for i, line := range lines {
@@ -455,6 +596,23 @@ func getListenersLinux() ([]string, error) {
 		}
 	}
 	return listeners, nil
+}
+
+func readPseudoFile(path string, limit int64) ([]byte, error) {
+	// #nosec G304 -- callers provide only fixed /proc evidence paths and the read is strictly bounded.
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > limit {
+		return nil, fmt.Errorf("evidence exceeds %d-byte limit", limit)
+	}
+	return data, nil
 }
 
 // parseProcNetAddr converts hex address from /proc/net/tcp to host:port.
@@ -515,7 +673,7 @@ func getListenersFallback() ([]string, error) {
 		cmd = exec.Command("ss", "-tlnH")
 	}
 
-	out, err := cmd.Output()
+	out, err := runBoundedCommand(cmd.Path, cmd.Args[1:]...)
 	if err != nil {
 		return nil, fmt.Errorf("netstat/ss: %w", err)
 	}
@@ -647,9 +805,9 @@ func parseMounts() (map[string]mountInfo, error) {
 	var err error
 
 	if runtime.GOOS == "linux" {
-		data, err = os.ReadFile("/proc/mounts")
+		data, err = readPseudoFile("/proc/mounts", maxProcEvidence)
 	} else {
-		data, err = exec.Command("mount").Output()
+		data, err = runBoundedCommand("mount")
 	}
 	if err != nil {
 		return nil, err
@@ -666,7 +824,7 @@ func parseMounts() (map[string]mountInfo, error) {
 			// Format: device mountpoint fstype options ...
 			mi.device = fields[0]
 			mi.fstype = fields[2]
-			mi.readonly = strings.Contains(fields[3], "ro")
+			mi.readonly = hasMountOption(fields[3], "ro")
 			mounts[fields[1]] = mi
 		} else {
 			// macOS: device on mountpoint (fstype, options)
@@ -699,6 +857,15 @@ func parseMounts() (map[string]mountInfo, error) {
 	return mounts, nil
 }
 
+func hasMountOption(options, wanted string) bool {
+	for _, option := range strings.Split(options, ",") {
+		if option == wanted {
+			return true
+		}
+	}
+	return false
+}
+
 // ---------------------------------------------------------------------------
 // GPU collector
 // ---------------------------------------------------------------------------
@@ -711,7 +878,12 @@ func collectGPUState(cfg GPUConfig) CollectorResult {
 	}
 
 	// Check NVIDIA devices.
-	nvidiaDevices := findNVIDIADevices()
+	nvidiaDevices, err := findNVIDIADevices()
+	if err != nil {
+		result.Status = "error"
+		result.Error = fmt.Sprintf("enumerate GPU devices: %v", err)
+		return result
+	}
 
 	allowedSet := make(map[string]bool)
 	for _, d := range cfg.AllowedDevices {
@@ -720,11 +892,11 @@ func collectGPUState(cfg GPUConfig) CollectorResult {
 
 	hasDrift := false
 	for _, dev := range nvidiaDevices {
-		if len(allowedSet) > 0 && !allowedSet[dev] {
+		if !allowedSet[dev] {
 			if cfg.DenyUnexpectedDevices {
 				result.Findings = append(result.Findings, Finding{
 					Key:    dev,
-					Status: "drift",
+					Status: "fail",
 					Detail: "unexpected GPU device exposed",
 				})
 				hasDrift = true
@@ -737,20 +909,34 @@ func collectGPUState(cfg GPUConfig) CollectorResult {
 			})
 		}
 	}
-
-	// Check nvidia-smi availability for additional info.
-	if smiPath, err := exec.LookPath("nvidia-smi"); err == nil {
-		out, err := exec.Command(smiPath, "--query-gpu=gpu_name,driver_version,memory.total", "--format=csv,noheader").Output()
-		if err == nil {
+	deviceSet := make(map[string]bool, len(nvidiaDevices))
+	for _, device := range nvidiaDevices {
+		deviceSet[device] = true
+	}
+	for _, expected := range cfg.AllowedDevices {
+		if !deviceSet[expected] {
 			result.Findings = append(result.Findings, Finding{
-				Key:    "nvidia-smi",
-				Status: "pass",
-				Detail: strings.TrimSpace(string(out)),
+				Key: expected, Expected: "present", Actual: "missing", Status: "fail",
+				Detail: "expected GPU device is not available",
 			})
+			hasDrift = true
 		}
 	}
 
-	if len(nvidiaDevices) == 0 {
+	// Check nvidia-smi availability for additional info.
+	if smiPath, err := exec.LookPath("nvidia-smi"); err == nil {
+		out, err := runBoundedCommand(smiPath, "--query-gpu=gpu_name,driver_version,memory.total", "--format=csv,noheader")
+		if err != nil {
+			result.Status = "error"
+			result.Error = "nvidia-smi evidence unavailable"
+			return result
+		}
+		result.Findings = append(result.Findings, Finding{
+			Key: "nvidia-smi", Status: "pass", Detail: strings.TrimSpace(string(out)),
+		})
+	}
+
+	if len(nvidiaDevices) == 0 && len(cfg.AllowedDevices) == 0 {
 		result.Findings = append(result.Findings, Finding{
 			Key:    "gpu_devices",
 			Status: "pass",
@@ -767,14 +953,26 @@ func collectGPUState(cfg GPUConfig) CollectorResult {
 }
 
 // findNVIDIADevices returns paths of NVIDIA device nodes.
-func findNVIDIADevices() []string {
+func findNVIDIADevices() ([]string, error) {
 	var devices []string
 	patterns := []string{"/dev/nvidia*", "/dev/dri/renderD*"}
 	for _, pattern := range patterns {
-		matches, _ := filepath.Glob(pattern)
-		devices = append(devices, matches...)
+		matches, err := filepath.Glob(pattern)
+		if err != nil {
+			return nil, err
+		}
+		for _, match := range matches {
+			info, err := os.Lstat(match)
+			if err != nil {
+				return nil, err
+			}
+			if info.Mode()&os.ModeSymlink != 0 || info.Mode()&os.ModeDevice == 0 {
+				return nil, fmt.Errorf("unsafe GPU device entry %q", match)
+			}
+			devices = append(devices, match)
+		}
 	}
-	return devices
+	return devices, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -817,7 +1015,7 @@ func collectPolicyState(cfg PolicyFilesConfig) CollectorResult {
 			continue
 		}
 
-		hash, err := sha256File(path)
+		hash, err := sha256FileBounded(path, maxPolicyEvidence)
 		if err != nil {
 			result.Findings = append(result.Findings, Finding{
 				Key:    name,
@@ -829,13 +1027,14 @@ func collectPolicyState(cfg PolicyFilesConfig) CollectorResult {
 		}
 
 		approvedHash, hasApproved := cfg.ApprovedHashes[name]
-		if !hasApproved {
+		if !hasApproved || !validSHA256(approvedHash) {
 			result.Findings = append(result.Findings, Finding{
 				Key:    name,
 				Actual: hash,
-				Status: "pass",
-				Detail: "no approved hash to compare (first attestation)",
+				Status: "fail",
+				Detail: "missing or invalid approved SHA-256 baseline",
 			})
+			hasDrift = true
 			continue
 		}
 
@@ -844,7 +1043,7 @@ func collectPolicyState(cfg PolicyFilesConfig) CollectorResult {
 				Key:      name,
 				Expected: approvedHash,
 				Actual:   hash,
-				Status:   "drift",
+				Status:   "fail",
 				Detail:   "policy file changed since last approved attestation",
 			})
 			hasDrift = true
