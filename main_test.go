@@ -317,8 +317,8 @@ func TestPolicyCollector_HashDrift(t *testing.T) {
 	}
 
 	result := collectPolicyState(cfg)
-	if result.Status != "drift" {
-		t.Fatalf("expected drift, got %s", result.Status)
+	if result.Status != "fail" {
+		t.Fatalf("expected fail, got %s", result.Status)
 	}
 }
 

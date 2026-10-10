@@ -400,96 +400,6 @@ func ensureJSONEOF(decoder *json.Decoder) error {
 }
 
 // ---------------------------------------------------------------------------
-// Container collector
-// ---------------------------------------------------------------------------
-
-// collectContainerState checks running containers against expected images.
-func collectContainerState(cfg ContainerConfig) CollectorResult {
-	result := CollectorResult{
-		Name:      "container",
-		Timestamp: time.Now().UTC().Format(time.RFC3339),
-	}
-
-	rt := cfg.Runtime
-	if rt == "" {
-		rt = "podman"
-	}
-	if len(cfg.ExpectedImages) == 0 {
-		result.Status = "error"
-		result.Error = "no expected container images configured"
-		return result
-	}
-
-	// Check if runtime is available.
-	if _, err := exec.LookPath(rt); err != nil {
-		result.Status = "skipped"
-		result.Error = fmt.Sprintf("%s not found in PATH", rt)
-		return result
-	}
-
-	// List running containers: output image digests.
-	out, err := runBoundedCommand(rt, "ps", "--format", "{{.Image}}|||{{.Names}}|||{{.ID}}")
-	if err != nil {
-		result.Status = "error"
-		result.Error = fmt.Sprintf("%s ps: %v", rt, err)
-		return result
-	}
-
-	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-	if len(lines) == 1 && lines[0] == "" {
-		result.Status = "pass"
-		result.Findings = append(result.Findings, Finding{
-			Key:    "running_containers",
-			Status: "pass",
-			Detail: "no running containers",
-		})
-		return result
-	}
-
-	expectedSet := make(map[string]bool)
-	for _, img := range cfg.ExpectedImages {
-		expectedSet[img] = true
-	}
-
-	hasDrift := false
-	for _, line := range lines {
-		parts := strings.SplitN(line, "|||", 3)
-		if len(parts) < 1 {
-			continue
-		}
-		image := strings.TrimSpace(parts[0])
-		name := ""
-		if len(parts) > 1 {
-			name = strings.TrimSpace(parts[1])
-		}
-
-		key := fmt.Sprintf("container:%s", name)
-		if len(expectedSet) > 0 && !expectedSet[image] {
-			result.Findings = append(result.Findings, Finding{
-				Key:    key,
-				Actual: image,
-				Status: "fail",
-				Detail: "unexpected container image",
-			})
-			hasDrift = true
-		} else {
-			result.Findings = append(result.Findings, Finding{
-				Key:    key,
-				Actual: image,
-				Status: "pass",
-			})
-		}
-	}
-
-	if hasDrift {
-		result.Status = "drift"
-	} else {
-		result.Status = "pass"
-	}
-	return result
-}
-
-// ---------------------------------------------------------------------------
 // Network collector
 // ---------------------------------------------------------------------------
 
@@ -954,8 +864,13 @@ func collectGPUState(cfg GPUConfig) CollectorResult {
 
 // findNVIDIADevices returns paths of NVIDIA device nodes.
 func findNVIDIADevices() ([]string, error) {
+	return findGPUDevicesUnder("/dev")
+}
+
+func findGPUDevicesUnder(root string) ([]string, error) {
 	var devices []string
-	patterns := []string{"/dev/nvidia*", "/dev/dri/renderD*"}
+	capabilityDir := filepath.Join(root, "nvidia-caps")
+	patterns := []string{filepath.Join(root, "nvidia*"), filepath.Join(root, "dri", "renderD*"), filepath.Join(capabilityDir, "nvidia-cap*")}
 	for _, pattern := range patterns {
 		matches, err := filepath.Glob(pattern)
 		if err != nil {
@@ -966,7 +881,10 @@ func findNVIDIADevices() ([]string, error) {
 			if err != nil {
 				return nil, err
 			}
-			if info.Mode()&os.ModeSymlink != 0 || info.Mode()&os.ModeDevice == 0 {
+			if match == capabilityDir && info.IsDir() {
+				continue // NVIDIA stores MIG capability device nodes here.
+			}
+			if info.Mode()&os.ModeSymlink != 0 || info.Mode()&os.ModeCharDevice == 0 {
 				return nil, fmt.Errorf("unsafe GPU device entry %q", match)
 			}
 			devices = append(devices, match)
@@ -1058,7 +976,7 @@ func collectPolicyState(cfg PolicyFilesConfig) CollectorResult {
 	}
 
 	if hasDrift {
-		result.Status = "drift"
+		result.Status = "fail"
 	} else {
 		result.Status = "pass"
 	}

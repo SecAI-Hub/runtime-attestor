@@ -21,10 +21,25 @@ attestation:
     # Max file size in bytes (default 10 GiB). Oversized files fail collection.
     max_file_size: 0
 
-  # Container image verification
+  # Deliberately incomplete: enroll approved source and immutable identities.
+  # An existing administrator-provisioned Libpod Unix API is required.
   container:
+    identity_schema: 1
+    scope: endpoint-inventory
     runtime: podman
-    expected_images: []
+    source:
+      socket: /run/podman/podman.sock
+      peer_uid: 0
+      collector_machine_id_sha256: ""  # SHA-256 of collector /etc/machine-id bytes
+      version: "5.8.4"
+      storage_root: /var/lib/containers/storage
+      storage_driver: overlay
+      run_root: /run/containers/storage
+      rootless: false
+    allowed_images: []
+    required_services: []
+    allow_empty: false
+    deny_unlisted_services: true
 
   # Network state verification
   network:

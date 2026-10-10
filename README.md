@@ -11,17 +11,52 @@
 - Registry connections require HTTPS except for loopback development endpoints.
 - `/health` is intentionally unauthenticated and discloses only readiness. Every `/v1/*` endpoint requires authentication and endpoint-wide rate limiting.
 
-The example policy is deliberately not a production trust baseline: populate exact container image references and approved policy hashes before relying on a passing verdict.
+The example policy is deliberately not a production trust baseline: enroll approved container endpoint/immutable image identities, required services, and approved policy hashes before relying on a passing verdict.
+
+## Container identity policy
+
+The container collector attests **endpoint-inventory**: the running inventory exposed by one operator-selected Unix socket, peer UID, engine version and storage identity. It does not attest every host namespace or other users' rootless stores. The collector machine-id hash binds the collector; it does **not** authenticate the daemon's physical host. A trusted local daemon or same-UID/root forwarding process is inside this boundary. Stronger host-wide scope is rejected.
+
+Identity schema 1 supports Docker 29.8.0 Engine API v1.49 and Podman 5.8.4 Libpod API. These are deliberately explicit adapter versions; other versions require qualification and a source update. Podman needs an existing administrator-provisioned API service. The collector never starts services, invokes a CLI, loads Docker contexts, follows engine/proxy environment variables, pulls images, or sends API writes. It requires Linux Unix peer credentials and access to a canonical socket without symlinks. Missing access is an error. Socket permissions do not make an unrestricted engine API read-only: retain the deployment privilege warning below, and do not grant root, host PID, ptrace, or unrestricted socket mounts to make this example pass.
+
+Remove `expected_images`, including empty/null values. Tags, labels, `Config.Image` and `RepoDigests` cannot be trusted image identities. Populate the existing protected policy file from an independently approved build/provenance baseline; never copy live image IDs into policy as automatic enrollment. The image identity is typed and bound to the selected engine/store:
+
+- `podman-image-id-v5`: the complete stored image ID, normalized as `sha256:<64 lowercase hex>` and matched to container and image inspection.
+- `docker-config-id`: legacy Docker image storage, with no multi-platform descriptor.
+- `docker-manifest`: engine image ID plus the actual platform manifest digest from the container. An engine ID may identify an OCI index and is never assumed to be a config digest. The immutable engine object is inspected with an explicit platform selector; the returned manifest must equal the container’s actual manifest, and its config platform must agree. Child manifest digests need not be independently addressable image-store names.
+
+All entries require `platform: linux/amd64`. Names locate services only; they cannot authorize their images. Every running container must match an allowed image. Every required service must match its exact named image entry. `deny_unlisted_services: true` also rejects extra service names using otherwise allowed images. `allow_empty` must be explicit and cannot be true with required services. The shipped container collector stays enabled and its empty allowlist is intentionally invalid.
+
+A Podman image/service policy fragment, with placeholders that must be replaced by independently approved digests:
+
+```yaml
+allowed_images:
+  - name: inference
+    kind: podman-image-id-v5
+    engine_image_id: "sha256:<approved 64 lowercase hex>"
+    platform: linux/amd64
+required_services:
+  - name: inference-service
+    image: inference
+allow_empty: false
+deny_unlisted_services: true
+```
+
+For Docker, set `runtime: docker`, source `version: "29.8.0"`, the exact `daemon_id`, `storage_root`, `storage_driver`, `rootless`, socket, peer UID and collector machine-id hash; omit Podman's `run_root`. A `docker-manifest` entry additionally requires `manifest_digest: "sha256:<approved actual platform manifest digest>"`. The source hash is SHA-256 of the exact `/etc/machine-id` file bytes, including its newline. Policy ownership, size and non-writable-file checks remain mandatory.
+
+The existing signed findings carry `container_scope:endpoint-inventory`, selected source identity and observed Unix peer PID/GID (PID availability is explicit when a namespace hides it), plus per-container immutable identity. Path privacy may redact paths, but preserves the scope limitation. No raw inspect environment, labels, image tags or engine error bodies enter reports. Failure produces no partial passing findings.
+
+Collection has a 10-second total deadline, 1 MiB per response, 16 MiB aggregate response limit and 128-container/image limits. Source-reported running counts, two full running inventories and repeated container inspections must agree. Duplicate/ambiguous identities, missing fields, unsupported platforms, errors, timeouts and changes fail closed. This is a bounded consistency sample: transient changes between reads, malicious daemon evidence, writable layers and bind mounts are outside its proof. It performs no layer rehashing or signer verification. Native Docker/Podman qualification is separate from the synthetic Unix API regression suite.
 
 ## Development
 
-Go 1.25 or newer is required for descriptor-rooted checkpoint filesystem
-operations; CI and production images use Go 1.26.5.
+Go 1.26.8 or newer is required for descriptor-rooted checkpoint filesystem
+operations; CI and production images use Go 1.27.2.
 
 ```sh
 go test -race ./...
 go vet ./...
-go run golang.org/x/vuln/cmd/govulncheck@v1.3.0 ./...
+go run golang.org/x/vuln/cmd/govulncheck@v1.7.0 ./...
 ```
 
 Generate a signing keypair and run a one-shot attestation:

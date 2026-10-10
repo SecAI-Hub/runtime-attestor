@@ -65,11 +65,6 @@ type ModelConfig struct {
 	MaxFileSize      int64    `yaml:"max_file_size"`
 }
 
-type ContainerConfig struct {
-	Runtime        string   `yaml:"runtime"`
-	ExpectedImages []string `yaml:"expected_images"`
-}
-
 type NetworkConfig struct {
 	AllowedListeners        []string `yaml:"allowed_listeners"`
 	DenyUnexpectedListeners bool     `yaml:"deny_unexpected_listeners"`
@@ -231,8 +226,10 @@ func validatePolicy(p AttestationPolicy) error {
 		p.Attestation.RateLimit.RequestsPerMinute < 0 {
 		return fmt.Errorf("interval and rate limits cannot be negative")
 	}
-	if runtimeName := p.Attestation.Container.Runtime; runtimeName != "" && runtimeName != "podman" && runtimeName != "docker" {
-		return fmt.Errorf("container runtime must be podman or docker")
+	if c.Container {
+		if err := validateContainerConfig(p.Attestation.Container); err != nil {
+			return fmt.Errorf("container identity policy: %w", err)
+		}
 	}
 	for _, mount := range p.Attestation.Mount.Expected {
 		if !filepath.IsAbs(mount.Path) || filepath.Clean(mount.Path) != mount.Path {

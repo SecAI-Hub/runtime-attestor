@@ -7,9 +7,9 @@ import (
 
 // redaction patterns
 var (
-	reAbsPath  = regexp.MustCompile(`(?:^|[\s"':=])(/(?:home|Users|var|tmp|etc|opt|usr|root|vault|run)/[^\s"']+)`)
+	reAbsPath  = regexp.MustCompile(`(?:^|[\s"':=])(/[^/\s"'][^\s"']*)`)
 	reWinPath  = regexp.MustCompile(`[A-Z]:\\[^\s"']+`)
-	reHostPort = regexp.MustCompile(`\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d+)\b`)
+	reHostPort = regexp.MustCompile(`(?:\b(?:\d{1,3}\.){3}\d{1,3}:\d+\b|\[[0-9A-Fa-f:.%a-zA-Z_-]+\]:\d+)`)
 )
 
 // redactReport applies privacy controls to a trust report.
